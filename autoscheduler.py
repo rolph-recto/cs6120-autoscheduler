@@ -3,6 +3,14 @@
 import itertools
 import z3
 
+### utils
+
+def flatten(lst):
+  return [item for elem in lst for item in elem]
+
+
+### data types for schedule and expressions
+
 # schedule data types
 
 SENTRY  = -1
@@ -48,13 +56,13 @@ def root(children):
   }
 
 
-def loop(func, var, loop_type, children, size):
+def loop(func, v, loop_type, children, size=None):
   return {
     "type": LOOP,
     "func": func,
-    "var": var,
+    "var": v,
     "loop_type": loop_type,
-    "size": size,
+    "size": size if size is not None else var((func, v)),
     "children": children
   }
 
@@ -63,7 +71,7 @@ def storage(func, children):
   return {
     "type": STORAGE,
     "func": func,
-    "size": 0,
+    "size": const(0),
     "children": children
   }
 
@@ -78,43 +86,6 @@ def compute(func, children):
     "func": func,
     "children": children
   }
-
-
-def print_schedule(schedule, indent=0):
-  if schedule["type"] == ROOT:
-    print (" " * indent),
-    print "root"
-    map(lambda c: print_schedule(c, indent+2), schedule["children"])
-
-  elif schedule["type"] == LOOP:
-    print (" " * indent),
-    print "loop", schedule["func"], schedule["var"], schedule["loop_type"], schedule["size"]
-    map(lambda c: print_schedule(c, indent+2), schedule["children"])
-
-  elif schedule["type"] == STORAGE:
-    print (" " * indent),
-    print "storage", schedule["func"]
-    map(lambda c: print_schedule(c, indent+2), schedule["children"])
-
-  elif schedule["type"] == COMPUTE:
-    print (" " * indent),
-    print "compute", schedule["func"]
-    map(lambda c: print_schedule(c, indent+2), schedule["children"])
-
-
-def copy_schedule(schedule):
-  if schedule["type"] == ROOT:
-    return root(map(copy_schedule, schedule["children"]))
-
-  elif schedule["type"] == LOOP:
-    return loop(schedule["func"], schedule["var"], schedule["loop_type"], \
-              map(copy_schedule, schedule["children"]), schedule["size"])
-
-  elif schedule["type"] == STORAGE:
-    return storage(schedule["func"], map(copy_schedule, schedule["children"]))
-
-  elif schedule["type"] == COMPUTE:
-    return compute(schedule["func"], map(copy_schedule, schedule["children"]))
 
 
 # function def data types
@@ -142,7 +113,7 @@ SQRT    = 7
 def func(f, x, y):
   return {
     "type": FUNC,
-    "func": f
+    "func": f,
     "x": x,
     "y": y
   }
@@ -150,15 +121,20 @@ def func(f, x, y):
 def x():
   return {
     "type": VAR,
-    "var": "x"
+    "var": X_VAR
   }
 
 def y():
   return {
     "type": VAR,
-    "var": "y"
+    "var": Y_VAR
   }
 
+def var(v):
+  return {
+    "type": VAR,
+    "var": v
+  }
 
 def const(n):
   return {
@@ -196,6 +172,83 @@ def tan(x):
 
 def sqrt(x):
   return op(SQRT, [x])
+
+
+def get_calls(expr, f):
+  if expr["type"] == FUNC:
+    if expr["func"] == f:
+      return [expr]
+
+  elif expr["type"] == VAR:
+    return []
+
+  elif expr["type"] == CONST:
+    return []
+
+  elif expr["type"] == OP:
+    return flatten(map(lambda o: get_calls(o, f), expr["operands"]))
+
+
+def print_schedule(schedule, indent=0):
+  if schedule["type"] == ROOT:
+    print (" " * indent),
+    print "root"
+    map(lambda c: print_schedule(c, indent+2), schedule["children"])
+
+  elif schedule["type"] == LOOP:
+    print (" " * indent),
+    print "loop", schedule["func"], schedule["var"], schedule["loop_type"], schedule["size"]
+    map(lambda c: print_schedule(c, indent+2), schedule["children"])
+
+  elif schedule["type"] == STORAGE:
+    print (" " * indent),
+    print "storage", schedule["func"]
+    map(lambda c: print_schedule(c, indent+2), schedule["children"])
+
+  elif schedule["type"] == COMPUTE:
+    print (" " * indent),
+    print "compute", schedule["func"]
+    map(lambda c: print_schedule(c, indent+2), schedule["children"])
+
+
+def copy_expr(expr):
+  if expr["type"] == FUNC:
+    return func(expr["func"], copy_expr(expr["x"]), copy_expr(expr["y"]))
+
+  elif expr["type"] == VAR:
+    return var(expr["var"])
+
+  elif expr["type"] == CONST:
+    return const(expr["val"])
+
+  elif expr["type"] == OP:
+    return op(expr["op"], map(copy_expr, expr["operands"]))
+
+def copy_schedule(schedule):
+  if schedule["type"] == ROOT:
+    return root(map(copy_schedule, schedule["children"]))
+
+  elif schedule["type"] == LOOP:
+    return loop(schedule["func"], schedule["var"], schedule["loop_type"], \
+              map(copy_schedule, schedule["children"]), \
+              copy_expr(schedule["size"]))
+
+  elif schedule["type"] == STORAGE:
+    return storage(schedule["func"], map(copy_schedule, schedule["children"]))
+
+  elif schedule["type"] == COMPUTE:
+    return compute(schedule["func"], map(copy_schedule, schedule["children"]))
+
+
+# get the functions that call this function
+def get_callers(func_info, func):
+  callers = []
+  for f in func_info:
+    if func in get_callees(func_info, f):
+      callers.append(f)
+
+  return callers
+
 
 # get the functions that this function calls
 def get_callees(func_info, func):
@@ -250,16 +303,20 @@ def get_descendants(node):
 # - storage node must be an ancestor of compute node and caller's compute nodes
 def is_legal_schedule(func_info, schedule):
   visit_list = [schedule]
+  ancestors = []
   compute_nodes_visited = []
 
   while len(visit_list) > 0:
     node = visit_list.pop()
-    if node["type"] == ROOT:
-      visit_list += list(reversed(node["children"]))
+    if node["type"] == SENTRY:
+      ancestors.pop()
+
+    elif node["type"] == ROOT:
+      visit_list.append(sentry())
+      visit_list.extend(list(reversed(node["children"])))
+      ancestors.append(node)
 
     elif node["type"] == LOOP:
-      visit_list += list(reversed(node["children"]))
-
       # illegal: should only vectorize innermost loops
       if node["loop_type"] == VECTORIZED:
         child_loops = [child for child in get_descendants(node) if child["type"] == LOOP]
@@ -267,16 +324,20 @@ def is_legal_schedule(func_info, schedule):
           print "vectorizing loop that is not innermost"
           return False
 
+      visit_list.append(sentry())
+      visit_list.extend(list(reversed(node["children"])))
+      ancestors.append(node)
+
     elif node["type"] == STORAGE:
-      visit_list += list(reversed(node["children"]))
+      visit_list.append(sentry())
+      visit_list.extend(list(reversed(node["children"])))
+      ancestors.append(node)
 
     elif node["type"] == COMPUTE:
       func = node["func"]
       inlined_funcs = [inlinedf["func"] for inlinedf in node["children"]]
       called_funcs = get_callees(func_info, func)
-
-      # TODO: this is wrong
-      storage_ancestors = [v["func"] for v in visit_list if v["type"] == STORAGE]
+      storage_ancestors = [a["func"] for a in ancestors if a["type"] == STORAGE]
 
       for f in called_funcs:
         # illegal: called function is neither inlined nor called!
@@ -290,7 +351,9 @@ def is_legal_schedule(func_info, schedule):
           return False
 
       compute_nodes_visited.append(node["func"])
-      visit_list += list(reversed(node["children"]))
+      visit_list.append(sentry())
+      visit_list.extend(list(reversed(node["children"])))
+      ancestors.append(node)
 
 
   return True
@@ -304,10 +367,10 @@ def inline_all_callees(func_info, func):
 
 # get default schedule for output function,
 # which inlines all called functions
-def default_schedule(func_info, func, width, height):
+def default_schedule(func_info, func):
   compute_f = inline_all_callees(func_info, func)
-  loop_x = loop(func, X_VAR, SEQUENTIAL, [compute_f], width)
-  loop_y = loop(func, Y_VAR, SEQUENTIAL, [loop_x], height)
+  loop_x = loop(func, X_VAR, SEQUENTIAL, [compute_f])
+  loop_y = loop(func, Y_VAR, SEQUENTIAL, [loop_x])
   return root([loop_y])
 
 
@@ -350,9 +413,9 @@ def split(func_info, schedule):
       for split_factor in SPLIT_FACTORS:
         if schedule["size"] % split_factor == 0:
           inner_loop = loop(schedule["func"], split_vars[1], \
-              schedule["loop_type"], schedule["children"], split_factor)
+              schedule["loop_type"], schedule["children"], const(split_factor))
           outer_loop = loop(schedule["func"], split_vars[0], \
-              schedule["loop_type"], [inner_loop], schedule["size"] / split_factor)
+              schedule["loop_type"], [inner_loop], divide(schedule["size"], split_factor))
 
           yield outer_loop
 
@@ -376,7 +439,10 @@ def reorder(func_info, schedule):
   if schedule["type"] == LOOP:
     children = schedule["children"]
     for i in range(len(children)):
-      if children[i]["type"] == LOOP and schedule["func"] == children[i]["func"]:
+      if children[i]["type"] == LOOP and schedule["func"] == children[i]["func"] \
+          and not ((schedule["var"] == X_OUTER_VAR and children[i]["var"] == X_INNER_VAR) \
+            or (schedule["var"] == Y_OUTER_VAR and children[i]["var"] == Y_INNER_VAR)):
+
         new_loop = copy_schedule(schedule)
         
         child_var = new_loop["children"][i]["var"]
@@ -465,10 +531,6 @@ def hoist_storage(func_info, schedule):
 @traverse_schedule
 def lower_storage(func_info, schedule):
   pass
-
-
-def flatten(lst):
-  return [item for elem in lst for item in elem]
 
 
 def remove_func(schedule, func):
@@ -601,8 +663,8 @@ def deinline(func_info, schedule):
 
     # build new subtree for de-inlined function
     compute_inlined = copy_schedule(inlined_map[inlined])
-    loop_x_inlined = loop(inlined, X_VAR, SEQUENTIAL, [compute_inlined], 0)
-    loop_y_inlined = loop(inlined, Y_VAR, SEQUENTIAL, [loop_x_inlined], 0)
+    loop_x_inlined = loop(inlined, X_VAR, SEQUENTIAL, [compute_inlined])
+    loop_y_inlined = loop(inlined, Y_VAR, SEQUENTIAL, [loop_x_inlined])
     storage_inlined = storage(inlined, [loop_y_inlined] + new_schedule["children"])
 
     new_schedule["children"] = [storage_inlined]
@@ -616,10 +678,168 @@ def deinline(func_info, schedule):
     yield new_schedule
 
 
-### bounds inference
-def infer_bounds(schedule):
-  varmap = {}
+def symname(func, var, n=None):
+  if n is None:
+    return "{}_{}".format(func, var)
 
+  else:
+    return "{}_{}_{}".format(func, var, n)
+
+### bounds inference
+def infer_bounds(func_info, schedule, outf, width, height):
+  solver = z3.Solver()
+
+  # map from loop index variables to Z3 symbolic variables
+  symvar_map = {}
+
+  # map from loop index variable to list of possible variants
+  variant_map = {}
+
+  def expr_to_symval(caller_x, caller_y, expr):
+    if expr["type"] == VAR and expr["var"] == X_VAR:
+      return caller_x
+
+    elif expr["type"] == VAR and expr["var"] == Y_VAR:
+      return caller_y
+
+    elif expr["type"] == VAR and expr["var"] in symvar_map:
+      return symvar_map[expr["var"]]
+
+    elif expr["type"] == CONST:
+      return expr["val"]
+
+    elif expr["type"] == OP:
+      if expr["op"] == PLUS:
+        lhs = expr_to_symval(caller_x, caller_y, expr["operands"][0])
+        rhs = expr_to_symval(caller_x, caller_y, expr["operands"][1])
+        return lhs + rhs
+
+      elif expr["op"] == MINUS:
+        lhs = expr_to_symval(caller_x, caller_y, expr["operands"][0])
+        rhs = expr_to_symval(caller_x, caller_y, expr["operands"][1])
+        return lhs - rhs
+
+      elif expr["op"] == TIMES:
+        lhs = expr_to_symval(caller_x, caller_y, expr["operands"][0])
+        rhs = expr_to_symval(caller_x, caller_y, expr["operands"][1])
+        return lhs * rhs
+
+      elif expr["op"] == DIVIDE:
+        lhs = expr_to_symval(caller_x, caller_y, expr["operands"][0])
+        rhs = expr_to_symval(caller_x, caller_y, expr["operands"][1])
+        return lhs / rhs
+
+      else:
+        raise ("operand " + expr["op"] + " not supported")
+
+    else:
+      raise ("expression type " + str(expr) + " not supported")
+
+
+  for f in func_info:
+    symvar_map[(f,X_VAR)] = z3.Int(symname(f,X_VAR))
+    symvar_map[(f,Y_VAR)] = z3.Int(symname(f,Y_VAR))
+    variant_map[(f,X_VAR)] = []
+    variant_map[(f,Y_VAR)] = []
+
+  ancestors = [] 
+  visit_list = [schedule]
+  while len(visit_list) > 0:
+    node = visit_list.pop()
+
+    if node["type"] == SENTRY:
+      ancestors.pop()
+
+    elif node["type"] == ROOT:
+      visit_list.append(sentry())
+      visit_list.extend(list(reversed(node["children"])))
+      ancestors.append(node)
+
+    elif node["type"] == LOOP:
+      # create symbolic values 
+
+      visit_list.append(sentry())
+      visit_list.extend(list(reversed(node["children"])))
+      ancestors.append(node)
+
+    elif node["type"] == STORAGE:
+      visit_list.append(sentry())
+      visit_list.extend(list(reversed(node["children"])))
+      ancestors.append(node)
+
+    # only try to infer bounds for non-output functions
+    elif node["type"] == COMPUTE and not node["func"] == outf:
+      func = node["func"]
+      storage_path = list(ancestors)
+      while not (storage_path[0]["type"] == STORAGE and storage_path[0]["func"] == func):
+        storage_path.pop(0)
+
+      callers = get_callers(func_info, func)
+      for caller in callers:
+        # compute loop indices for callers by traversing path from
+        # storage node to compute node; these then are multiplied together
+        caller_x_list = []
+        caller_y_list = []
+        for node in storage_path:
+          if node["type"] == LOOP and node["func"] == caller:
+            if node["var"] in [X_VAR, X_INNER_VAR, X_OUTER_VAR]:
+              caller_x_list.append(expr_to_symval(None, None, node["size"]))
+
+            if node["var"] in [Y_VAR, Y_INNER_VAR, Y_OUTER_VAR]:
+              caller_y_list.append(expr_to_symval(None, None, node["size"]))
+
+        caller_x = reduce(lambda x, acc: x*acc, caller_x_list, 1)
+        caller_y = reduce(lambda y, acc: y*acc, caller_y_list, 1)
+
+        
+        map(lambda p: print_schedule(p), storage_path)
+        print caller, caller_x, caller_y
+
+        calls = get_calls(func_info[caller], func)
+        for call in calls:
+          nx = len(variant_map[(func,X_VAR)]) + 1
+          ny = len(variant_map[(func,Y_VAR)]) + 1
+
+          sym_x = z3.Int(symname(func,X_VAR,nx))
+          sym_y = z3.Int(symname(func,Y_VAR,ny))
+
+          variant_map[(func,X_VAR)].append(sym_x)
+          variant_map[(func,Y_VAR)].append(sym_y)
+
+          val_x = expr_to_symval(caller_x, caller_y, call["x"])
+          val_y = expr_to_symval(caller_x, caller_y, call["y"])
+
+          solver.add(sym_x == val_x)
+          solver.add(sym_y == val_y)
+
+  # check if satisfiable and retrieve model
+  for key in variant_map:
+    # set variable to be the max of all variants
+    if len(variant_map[key]) > 0:
+      sym = symvar_map[key]
+      variants = variant_map[key]
+
+      for variant in variants:
+        solver.add(sym >= variant)
+
+      # eq_clause = reduce(lambda v, acc: z3.Or(acc, sym == v), variants)
+      # solver.add(eq_clause)
+
+  # set output dimensions
+  out_x = symvar_map[(outf,X_VAR)]
+  out_y = symvar_map[(outf,Y_VAR)]
+  solver.add(out_x == width)
+  solver.add(out_y == height)
+
+  if solver.check() == z3.sat:
+    model = solver.model()
+
+    for key in symvar_map:
+      val = model.eval(symvar_map[key])
+      print "model: ", key, " = ", val
+
+  else:
+    print "constraints unsatisfiable!"
 
 # give information about:
 # - the number of arithmetic operations performed
@@ -706,7 +926,9 @@ func_info = {
   "g": const(2)
 }
 
-s1 = default_schedule(func_info, "f", 512, 512)
+s1 = default_schedule(func_info, "f")
+s2 = list(deinline(func_info, s1))[0]
+s3 = list(hoist_storage(func_info, s2))[0]
 
 # use Z3 for bounds inference
 # q(x, y) = x * y
