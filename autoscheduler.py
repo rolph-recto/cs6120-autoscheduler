@@ -43,6 +43,7 @@ Y_OUTER_VAR = "y_outer"
 XY_VAR      = "xy"
 
 SPLIT_FACTORS = [2, 4, 8, 16, 32, 64, 128]
+VECTOR_SIZES  = [2, 4, 8]
 
 
 # smart constructors
@@ -181,7 +182,7 @@ def eval_expr(env, expr):
     return env[expr["var"]]
 
   elif expr["type"] == VAR and expr["var"] not in env:
-    raise ("eval_expr: var " + str(expr["var"]) + " not found in environment")
+    raise Exception("eval_expr: var " + str(expr["var"]) + " not found in environment")
 
   elif expr["type"] == CONST:
     return expr["val"]
@@ -208,10 +209,10 @@ def eval_expr(env, expr):
       return val_lhs / val_rhs
 
     else:
-      raise ("operand " + expr["op"] + " not supported")
+      raise Exception("operand " + expr["op"] + " not supported")
 
   else:
-    raise ("expression type " + str(expr) + " not supported")
+    raise Exception("expression type " + str(expr) + " not supported")
 
 
 def get_calls(expr, f):
@@ -269,9 +270,12 @@ def copy_schedule(schedule):
     return root(map(copy_schedule, schedule["children"]))
 
   elif schedule["type"] == LOOP:
+    size = schedule["size"]
+    if type(schedule["size"]) != int:
+      size = copy_expr(schedule["size"])
+
     return loop(schedule["func"], schedule["var"], schedule["loop_type"], \
-              map(copy_schedule, schedule["children"]), \
-              copy_expr(schedule["size"]))
+              map(copy_schedule, schedule["children"]), size)
 
   elif schedule["type"] == STORAGE:
     return storage(schedule["func"], map(copy_schedule, schedule["children"]))
@@ -292,14 +296,14 @@ def get_callers(func_info, func):
 
 # get the functions that this function calls
 def get_callees(func_info, func):
-  funcs = []
+  funcs = set()
   node_list = [func_info[func]]
 
   while len(node_list) > 0:
     node = node_list.pop()
 
     if node["type"] == FUNC:
-      funcs.append(node["func"])
+      funcs.add(node["func"])
 
     elif node["type"] == VAR:
       pass
@@ -451,13 +455,12 @@ def split(func_info, schedule):
     split_vars = get_split_variable(schedule["var"])
     if len(split_vars) > 0:
       for split_factor in SPLIT_FACTORS:
-        if schedule["size"] % split_factor == 0:
-          inner_loop = loop(schedule["func"], split_vars[1], \
-              schedule["loop_type"], schedule["children"], const(split_factor))
-          outer_loop = loop(schedule["func"], split_vars[0], \
-              schedule["loop_type"], [inner_loop], divide(schedule["size"], const(split_factor)))
+        inner_loop = loop(schedule["func"], split_vars[1], \
+            schedule["loop_type"], schedule["children"], const(split_factor))
+        outer_loop = loop(schedule["func"], split_vars[0], \
+            schedule["loop_type"], [inner_loop], divide(schedule["size"], const(split_factor)))
 
-          yield outer_loop
+        yield outer_loop
 
 
 def get_fuse_variable(var1, var2):
@@ -505,11 +508,18 @@ def change_loop_type(func_info, schedule):
   if schedule["type"] == LOOP:
     new_loops = []
 
-    loop_types = [SEQUENTIAL, PARALLEL, VECTORIZED]
+    loop_types = [SEQUENTIAL, VECTORIZED]
     for new_loop_type in filter(lambda x: x != schedule["loop_type"], loop_types):
-      new_loop = copy_schedule(schedule)
-      new_loop["loop_type"] = new_loop_type
-      yield new_loop
+      can_change = True
+      if new_loop_type == VECTORIZED:
+        if schedule["size"]["type"] != CONST \
+            or schedule["size"]["val"] not in VECTOR_SIZES:
+          can_change = False
+
+      if can_change:
+        new_loop = copy_schedule(schedule)
+        new_loop["loop_type"] = new_loop_type
+        yield new_loop
 
 
 @traverse_schedule
@@ -773,10 +783,10 @@ def infer_bounds(func_info, schedule, outf, width, height):
         return lhs / rhs
 
       else:
-        raise ("operand " + expr["op"] + " not supported")
+        raise Exception("operand " + expr["op"] + " not supported")
 
     else:
-      raise ("expression type " + str(expr) + " not supported")
+      raise Exception("expression type " + str(expr) + " not supported")
 
 
   for f in func_info:
@@ -785,6 +795,7 @@ def infer_bounds(func_info, schedule, outf, width, height):
     variant_map[(f,X_VAR)] = []
     variant_map[(f,Y_VAR)] = []
 
+  visited_compute_nodes = set([(outf,X_VAR),(outf,Y_VAR)])
   ancestors = [] 
   visit_list = [schedule]
   while len(visit_list) > 0:
@@ -811,6 +822,9 @@ def infer_bounds(func_info, schedule, outf, width, height):
     # only try to infer bounds for non-output functions
     elif node["type"] == COMPUTE and not node["func"] == outf:
       func = node["func"]
+      visited_compute_nodes.add((func,X_VAR))
+      visited_compute_nodes.add((func,Y_VAR))
+
       storage_path = list(ancestors)
       while not (storage_path[0]["type"] == STORAGE and storage_path[0]["func"] == func):
         storage_path.pop(0)
@@ -849,7 +863,6 @@ def infer_bounds(func_info, schedule, outf, width, height):
           solver.add(sym_x == val_x)
           solver.add(sym_y == val_y)
 
-
   ## retrieve model to compute min and max bounds
   # f is either min or max
   def get_model_map(f, dimx, dimy):
@@ -879,7 +892,7 @@ def infer_bounds(func_info, schedule, outf, width, height):
     if solver.check() == z3.sat:
       model = solver.model()
 
-      for key in symvar_map:
+      for key in visited_compute_nodes:
         val = model.eval(symvar_map[key])
         model_map[key] = val.as_long()
 
@@ -888,7 +901,7 @@ def infer_bounds(func_info, schedule, outf, width, height):
       return model_map
 
     else:
-      raise "constraints unsatisfiable!"
+      raise Exception("constraints unsatisfiable!")
 
   max_map = get_model_map(lambda sym, variant: sym >= variant, width, height)
   min_map = get_model_map(lambda sym, variant: sym <= variant, 1, 1)
@@ -897,7 +910,7 @@ def infer_bounds(func_info, schedule, outf, width, height):
 
   ## compute loop sizes
   size_map = {}
-  for key in symvar_map:
+  for key in visited_compute_nodes:
     size = max_map[key] - min_map[key] + 1
     size_map[key] = size
 
@@ -953,7 +966,11 @@ def execution_info(func_info, schedule):
   while len(visit_list) > 0:
     node = visit_list.pop()
     upstream_loops = [a for a in ancestors if a["type"] == LOOP]
-    iterations = reduce(lambda x,y: x*y, [loop["size"] for loop in upstream_loops], 1)
+    iterations = 1
+    for loop in upstream_loops:
+      # don't multiply iterations if loop is vectorized
+      if loop["loop_type"] == SEQUENTIAL:
+        iterations *= loop["size"]
 
     if node["type"] == SENTRY:
       ancestors.pop()
@@ -1039,7 +1056,7 @@ def execution_info(func_info, schedule):
 LOAD_WEIGHT   = 1.0
 STORE_WEIGHT  = 1.0
 ARITH_WEIGHT  = 1.0
-MATH_WEIGHT   = 1.0
+MATH_WEIGHT   = 3.0
 
 def estimate_cost(exec_info):
   cost = 0.0
@@ -1063,7 +1080,8 @@ def cost_estimator(func_info):
 
 
 def mutate(func_info, schedule):
-  mutators = [split, reorder, hoist_compute, lower_compute, hoist_storage, inline, deinline]
+  mutators = [split, reorder, change_loop_type, hoist_compute, \
+              lower_compute, hoist_storage, inline, deinline]
 
   for mutator in mutators:
     for mutant in mutator(func_info, schedule):
@@ -1071,41 +1089,59 @@ def mutate(func_info, schedule):
         yield mutant
 
 # genetic algorithm search
-def search(num_gen, pop_size, selection_num, func_info, outf, width, height):
+NUM_GENERATIONS = 20
+POPULATION_SIZE = 250
+SELECTION_NUM   = 50
+
+def search_schedule(func_info, outf, width, height):
   population = []
-  population.append(default_schedule(func_info, outf))
   estimator = cost_estimator(func_info)
 
+  default = default_schedule(func_info, outf)
+  size_map = infer_bounds(func_info, default, outf, width, height)
+  annot_default = annotate_schedule_size(size_map, default)
+  population.append((default,annot_default))
+
   gen = 1
-  while gen < num_gen:
+  while gen < NUM_GENERATIONS:
+    print "generation", str(gen), "population", str(len(population))
+    print "best schedule, cost", round(estimator(population[0][1]), 2)
+    print_schedule(population[0][1])
+
     # "roulette" selection
-    pop_inv_cost = [(s,1.0/estimator(s)) for s in population]
+    pop_inv_cost = [(s,1.0/estimator(a)) for (s,a) in population]
     total = sum(map(lambda (s,c): c, pop_inv_cost))
 
     selected_list = []
-    for i in range(selection_num):
+    for i in range(SELECTION_NUM):
       n = total * random.random()
       p = 0.0
 
       for s,c in ((s,c) for (s,c) in pop_inv_cost if s not in selected_list):
         p += c
         if p >= n:
-          selected.append(s)
+          selected_list.append(s)
+          total -= c
           break
 
     # mutation
     for selected in selected_list:
-      for schedule in mutate(func_info, selected):
-        size_map = infer_bounds(func_info, schedule, outf, width, height)
-        annot_mutant = annotate_schedule_size(size_map, schedule)
-        population.append(mutant)
+      for mutant in mutate(func_info, selected):
+        size_map = infer_bounds(func_info, mutant, outf, width, height)
+        annot_mutant = annotate_schedule_size(size_map, mutant)
+        population.append((mutant, annot_mutant))
 
     # only keep the fittest
-    population.sort(cmp=estimator)
-    population = population[:pop_size]
+    population.sort(key=(lambda (s,a): a), \
+        cmp=lambda s1, s2: estimator(s1) <= estimator(s2))
+    population = population[:POPULATION_SIZE]
     gen += 1
 
-  return population[0]
+  for _,schedule in population:
+    print_schedule(schedule)
+    print "cost", estimator(schedule)
+
+  return population[0][1]
 
 
 ### convert schedule tree into halide code
@@ -1118,14 +1154,14 @@ def convert_to_halide(schedule):
 
 func_info = {
   "f": plus(func("g", plus(y(), const(1)), x()), func("g", x(), y())),
-  "g": plus(x(), y())
+  "g": sqrt(times(x(), y()))
 }
 
-s1 = default_schedule(func_info, "f")
-s2 = list(deinline(func_info, s1))[0]
-s3 = list(hoist_storage(func_info, s2))[0]
-
-size_map = infer_bounds(func_info, s3, "f", 512, 512)
-s4 = annotate_schedule_size(size_map, s3)
+# s1 = default_schedule(func_info, "f")
+# s2 = list(deinline(func_info, s1))[0]
+# s3 = list(hoist_storage(func_info, s2))[0]
+# 
+# size_map = infer_bounds(func_info, s3, "f", 512, 512)
+# s4 = annotate_schedule_size(size_map, s3)
 
 
