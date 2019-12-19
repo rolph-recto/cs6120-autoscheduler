@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import itertools
+import random
 import z3
 
 ### utils
@@ -172,6 +173,8 @@ def tan(x):
 
 def sqrt(x):
   return op(SQRT, [x])
+
+# datatype utils
 
 def eval_expr(env, expr):
   if expr["type"] == VAR and expr["var"] in env:
@@ -358,7 +361,7 @@ def is_legal_schedule(func_info, schedule):
       if node["loop_type"] == VECTORIZED:
         child_loops = [child for child in get_descendants(node) if child["type"] == LOOP]
         if len(child_loops) > 0:
-          print "vectorizing loop that is not innermost"
+          # print "vectorizing loop that is not innermost"
           return False
 
       visit_list.append(sentry())
@@ -379,12 +382,12 @@ def is_legal_schedule(func_info, schedule):
       for f in called_funcs:
         # illegal: called function is neither inlined nor called!
         if f not in inlined_funcs and f not in compute_nodes_visited:
-          print "function not a storage ancestor"
+          # print "function not a storage ancestor"
           return False
 
         # illegal: storage must be an ancestor of called functions
         if f not in inlined_funcs and f not in storage_ancestors:
-          print "called function not a storage ancestor"
+          # print "called function not a storage ancestor"
           return False
 
       compute_nodes_visited.append(node["func"])
@@ -715,6 +718,8 @@ def deinline(func_info, schedule):
     yield new_schedule
 
 
+## bounds inference
+
 def symname(func, var, n=None):
   if n is None:
     return "{}_{}".format(func, var)
@@ -722,7 +727,6 @@ def symname(func, var, n=None):
   else:
     return "{}_{}_{}".format(func, var, n)
 
-### bounds inference
 def infer_bounds(func_info, schedule, outf, width, height):
   global solver
 
@@ -920,6 +924,8 @@ def annotate_schedule_size(size_map, schedule):
     return compute(schedule["func"], map(copy_schedule, schedule["children"]))
 
 
+### cost estimation
+
 # give information about:
 # - the number of arithmetic operations performed
 # - the number of loads
@@ -928,9 +934,19 @@ def annotate_schedule_size(size_map, schedule):
 # this function assumes the loops in schedule have been decorated
 # with size information, computed during bounds inference
 def execution_info(func_info, schedule):
-  loads = 0
-  stores = 0
-  operations = 0
+  info = {
+    "load": 0,
+    "store": 0,
+    "+": 0,
+    "-": 0,
+    "*": 0,
+    "/": 0,
+    "sin": 0,
+    "cos": 0,
+    "tan": 0,
+    "sqrt": 0
+  }
+
   ancestors  = []
   visit_list = [schedule]
 
@@ -953,7 +969,8 @@ def execution_info(func_info, schedule):
       ancestors.append(node)
 
     elif node["type"] == STORAGE:
-      stores += (iterations * node["size"])
+      info["store"] += (iterations * node["size"])
+      info["store"]
 
       visit_list.append(sentry())
       visit_list.extend(list(reversed(node["children"])))
@@ -973,13 +990,36 @@ def execution_info(func_info, schedule):
           pass
 
         elif expr["type"] == OP:
-          operations += iterations
+          if expr["op"] == PLUS:
+            info["+"] += iterations
+
+          elif expr["op"] == MINUS:
+            info["-"] += iterations
+
+          elif expr["op"] == TIMES:
+            info["*"] += iterations
+
+          elif expr["op"] == DIVIDE:
+            info["/"] += iterations
+
+          elif expr["op"] == SIN:
+            info["sin"] += iterations
+
+          elif expr["op"] == COS:
+            info["cos"] += iterations
+
+          elif expr["op"] == TAN:
+            info["tan"] += iterations
+
+          elif expr["op"] == SQRT:
+            info["sqrt"] += iterations
+
           expr_list.extend(expr["operands"])
 
         elif expr["type"] == FUNC:
           # already saved; load from storage
           if expr["func"] not in inlined_funcs:
-            loads += iterations
+            info["load"] += iterations
 
           # inlined, so we need to compute
           else:
@@ -993,12 +1033,88 @@ def execution_info(func_info, schedule):
 
             inlined_funcs = [c["func"] for c in cur_node["children"]]
 
-  return {
-    "loads": loads,
-    "stores": stores,
-    "operations": operations
-  }
+  return info
 
+
+LOAD_WEIGHT   = 1.0
+STORE_WEIGHT  = 1.0
+ARITH_WEIGHT  = 1.0
+MATH_WEIGHT   = 1.0
+
+def estimate_cost(exec_info):
+  cost = 0.0
+  cost += LOAD_WEIGHT * float(exec_info["load"])
+  cost += STORE_WEIGHT * float(exec_info["store"])
+
+  arith_ops = exec_info["+"] + exec_info["-"] + exec_info["*"] + exec_info["/"]
+  cost += ARITH_WEIGHT * float(arith_ops)
+
+  math_ops = exec_info["sin"] + exec_info["cos"] + exec_info["tan"] + exec_info["sqrt"]
+  cost += MATH_WEIGHT * float(math_ops)
+  return cost
+
+
+def cost_estimator(func_info):
+  def wrapper(schedule):
+    exec_info = execution_info(func_info, schedule)
+    return estimate_cost(exec_info)
+
+  return wrapper
+
+
+def mutate(func_info, schedule):
+  mutators = [split, reorder, hoist_compute, lower_compute, hoist_storage, inline, deinline]
+
+  for mutator in mutators:
+    for mutant in mutator(func_info, schedule):
+      if is_legal_schedule(func_info, mutant):
+        yield mutant
+
+# genetic algorithm search
+def search(num_gen, pop_size, selection_num, func_info, outf, width, height):
+  population = []
+  population.append(default_schedule(func_info, outf))
+  estimator = cost_estimator(func_info)
+
+  gen = 1
+  while gen < num_gen:
+    # "roulette" selection
+    pop_inv_cost = [(s,1.0/estimator(s)) for s in population]
+    total = sum(map(lambda (s,c): c, pop_inv_cost))
+
+    selected_list = []
+    for i in range(selection_num):
+      n = total * random.random()
+      p = 0.0
+
+      for s,c in ((s,c) for (s,c) in pop_inv_cost if s not in selected_list):
+        p += c
+        if p >= n:
+          selected.append(s)
+          break
+
+    # mutation
+    for selected in selected_list:
+      for schedule in mutate(func_info, selected):
+        size_map = infer_bounds(func_info, schedule, outf, width, height)
+        annot_mutant = annotate_schedule_size(size_map, schedule)
+        population.append(mutant)
+
+    # only keep the fittest
+    population.sort(cmp=estimator)
+    population = population[:pop_size]
+    gen += 1
+
+  return population[0]
+
+
+### convert schedule tree into halide code
+
+def convert_to_halide(schedule):
+  pass
+
+
+### example
 
 func_info = {
   "f": plus(func("g", plus(y(), const(1)), x()), func("g", x(), y())),
@@ -1009,45 +1125,7 @@ s1 = default_schedule(func_info, "f")
 s2 = list(deinline(func_info, s1))[0]
 s3 = list(hoist_storage(func_info, s2))[0]
 
-# use Z3 for bounds inference
-# q(x, y) = x * y
-# p(x, y) = q(x,y) - q(x+1, y+1)
-# c(x,y)  = p(x,y) + p(x+1, y+1)
-#
-# (declare-const cx Int)
-# (declare-const cy Int)
-# 
-# (declare-const px1 Int)
-# (declare-const py1 Int)
-# (declare-const px2 Int)
-# (declare-const py2 Int)
-# (declare-const px Int)
-# (declare-const py Int)
-# 
-# (declare-const qx1 Int)
-# (declare-const qy1 Int)
-# (declare-const qx2 Int)
-# (declare-const qy2 Int)
-# (declare-const qx Int)
-# (declare-const qy Int)
-# 
-# (assert (= px1 (+ cx 1)))
-# (assert (= py1 (+ cy 1)))
-# (assert (= px2 cx))
-# (assert (= py2 cy))
-# (assert (and (<= px px1) (<= px px2) (or (= px px1) (= px px2))))
-# (assert (and (<= py py1) (<= px py2) (or (= py py1) (= py py2))))
-# 
-# (assert (= qx1 (+ px 1)))
-# (assert (= qy1 (+ py 1)))
-# (assert (= qx2 px))
-# (assert (= qy2 py))
-# (assert (and (<= qx qx1) (<= qx qx2) (or (= qx qx1) (= qx qx2))))
-# (assert (and (<= qy qy1) (<= qx qy2) (or (= qy qy1) (= qy qy2))))
-# 
-# (assert (= cx 1))
-# (assert (= cy 1))
-# (check-sat)
-# (get-model)
+size_map = infer_bounds(func_info, s3, "f", 512, 512)
+s4 = annotate_schedule_size(size_map, s3)
 
 
