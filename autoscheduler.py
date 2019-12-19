@@ -8,6 +8,7 @@ import z3
 def flatten(lst):
   return [item for elem in lst for item in elem]
 
+solver = z3.Solver()
 
 ### data types for schedule and expressions
 
@@ -71,7 +72,7 @@ def storage(func, children):
   return {
     "type": STORAGE,
     "func": func,
-    "size": const(0),
+    "size": times(var((func,X_VAR)), var((func,Y_VAR))),
     "children": children
   }
 
@@ -106,7 +107,6 @@ SIN     = 4
 COS     = 5
 TAN     = 6
 SQRT    = 7
-
 
 # smart constructors
 
@@ -173,6 +173,43 @@ def tan(x):
 def sqrt(x):
   return op(SQRT, [x])
 
+def eval_expr(env, expr):
+  if expr["type"] == VAR and expr["var"] in env:
+    return env[expr["var"]]
+
+  elif expr["type"] == VAR and expr["var"] not in env:
+    raise ("eval_expr: var " + str(expr["var"]) + " not found in environment")
+
+  elif expr["type"] == CONST:
+    return expr["val"]
+
+  elif expr["type"] == OP:
+    if expr["op"] == PLUS:
+      val_lhs = eval_expr(env, expr["operands"][0])
+      val_rhs = eval_expr(env, expr["operands"][1])
+      return val_lhs + val_rhs
+
+    if expr["op"] == MINUS:
+      val_lhs = eval_expr(env, expr["operands"][0])
+      val_rhs = eval_expr(env, expr["operands"][1])
+      return val_lhs - val_rhs
+
+    if expr["op"] == TIMES:
+      val_lhs = eval_expr(env, expr["operands"][0])
+      val_rhs = eval_expr(env, expr["operands"][1])
+      return val_lhs * val_rhs
+
+    if expr["op"] == DIVIDE:
+      val_lhs = eval_expr(env, expr["operands"][0])
+      val_rhs = eval_expr(env, expr["operands"][1])
+      return val_lhs / val_rhs
+
+    else:
+      raise ("operand " + expr["op"] + " not supported")
+
+  else:
+    raise ("expression type " + str(expr) + " not supported")
+
 
 def get_calls(expr, f):
   if expr["type"] == FUNC:
@@ -202,7 +239,7 @@ def print_schedule(schedule, indent=0):
 
   elif schedule["type"] == STORAGE:
     print (" " * indent),
-    print "storage", schedule["func"]
+    print "storage", schedule["func"], schedule["size"]
     map(lambda c: print_schedule(c, indent+2), schedule["children"])
 
   elif schedule["type"] == COMPUTE:
@@ -415,7 +452,7 @@ def split(func_info, schedule):
           inner_loop = loop(schedule["func"], split_vars[1], \
               schedule["loop_type"], schedule["children"], const(split_factor))
           outer_loop = loop(schedule["func"], split_vars[0], \
-              schedule["loop_type"], [inner_loop], divide(schedule["size"], split_factor))
+              schedule["loop_type"], [inner_loop], divide(schedule["size"], const(split_factor)))
 
           yield outer_loop
 
@@ -687,7 +724,9 @@ def symname(func, var, n=None):
 
 ### bounds inference
 def infer_bounds(func_info, schedule, outf, width, height):
-  solver = z3.Solver()
+  global solver
+
+  solver.push()
 
   # map from loop index variables to Z3 symbolic variables
   symvar_map = {}
@@ -756,8 +795,6 @@ def infer_bounds(func_info, schedule, outf, width, height):
       ancestors.append(node)
 
     elif node["type"] == LOOP:
-      # create symbolic values 
-
       visit_list.append(sentry())
       visit_list.extend(list(reversed(node["children"])))
       ancestors.append(node)
@@ -788,12 +825,8 @@ def infer_bounds(func_info, schedule, outf, width, height):
             if node["var"] in [Y_VAR, Y_INNER_VAR, Y_OUTER_VAR]:
               caller_y_list.append(expr_to_symval(None, None, node["size"]))
 
-        caller_x = reduce(lambda x, acc: x*acc, caller_x_list, 1)
-        caller_y = reduce(lambda y, acc: y*acc, caller_y_list, 1)
-
-        
-        map(lambda p: print_schedule(p), storage_path)
-        print caller, caller_x, caller_y
+        caller_x = reduce(lambda x, acc: x*acc, caller_x_list, z3.IntVal(1))
+        caller_y = reduce(lambda y, acc: y*acc, caller_y_list, z3.IntVal(1))
 
         calls = get_calls(func_info[caller], func)
         for call in calls:
@@ -812,34 +845,80 @@ def infer_bounds(func_info, schedule, outf, width, height):
           solver.add(sym_x == val_x)
           solver.add(sym_y == val_y)
 
-  # check if satisfiable and retrieve model
-  for key in variant_map:
-    # set variable to be the max of all variants
-    if len(variant_map[key]) > 0:
-      sym = symvar_map[key]
-      variants = variant_map[key]
 
-      for variant in variants:
-        solver.add(sym >= variant)
+  ## retrieve model to compute min and max bounds
+  # f is either min or max
+  def get_model_map(f, dimx, dimy):
+    model_map = {}
 
-      # eq_clause = reduce(lambda v, acc: z3.Or(acc, sym == v), variants)
-      # solver.add(eq_clause)
+    # compute max
+    solver.push()
 
-  # set output dimensions
-  out_x = symvar_map[(outf,X_VAR)]
-  out_y = symvar_map[(outf,Y_VAR)]
-  solver.add(out_x == width)
-  solver.add(out_y == height)
+    # set output dimensions
+    out_x = symvar_map[(outf,X_VAR)]
+    out_y = symvar_map[(outf,Y_VAR)]
+    solver.add(out_x == dimx)
+    solver.add(out_y == dimy)
 
-  if solver.check() == z3.sat:
-    model = solver.model()
+    for key in variant_map:
+      # set variable to be the max of all variants
+      if len(variant_map[key]) > 0:
+        sym = symvar_map[key]
+        variants = variant_map[key]
 
-    for key in symvar_map:
-      val = model.eval(symvar_map[key])
-      print "model: ", key, " = ", val
+        for variant in variants:
+          solver.add(f(sym, variant))
 
-  else:
-    print "constraints unsatisfiable!"
+        eq_clause = z3.Or(*[sym == v for v in variants])
+        solver.add(eq_clause)
+
+    if solver.check() == z3.sat:
+      model = solver.model()
+
+      for key in symvar_map:
+        val = model.eval(symvar_map[key])
+        model_map[key] = val.as_long()
+
+      solver.pop()
+
+      return model_map
+
+    else:
+      raise "constraints unsatisfiable!"
+
+  max_map = get_model_map(lambda sym, variant: sym >= variant, width, height)
+  min_map = get_model_map(lambda sym, variant: sym <= variant, 1, 1)
+
+  solver.pop()
+
+  ## compute loop sizes
+  size_map = {}
+  for key in symvar_map:
+    size = max_map[key] - min_map[key] + 1
+    size_map[key] = size
+
+  return size_map
+
+
+# annotate schedule's loop and storage nodes with sizes
+def annotate_schedule_size(size_map, schedule):
+  if schedule["type"] == ROOT:
+    return root(map(lambda c: annotate_schedule_size(size_map, c), schedule["children"]))
+
+  elif schedule["type"] == LOOP:
+    return loop(schedule["func"], schedule["var"], schedule["loop_type"], \
+              map(lambda c: annotate_schedule_size(size_map, c), schedule["children"]), \
+              eval_expr(size_map, schedule["size"]))
+
+  elif schedule["type"] == STORAGE:
+    node = storage(schedule["func"], \
+              map(lambda c: annotate_schedule_size(size_map, c), schedule["children"]))
+    node["size"] = eval_expr(size_map, schedule["size"])
+    return node
+
+  elif schedule["type"] == COMPUTE:
+    return compute(schedule["func"], map(copy_schedule, schedule["children"]))
+
 
 # give information about:
 # - the number of arithmetic operations performed
@@ -922,8 +1001,8 @@ def execution_info(func_info, schedule):
 
 
 func_info = {
-  "f": plus(func("g", x(), y()), const(1)),
-  "g": const(2)
+  "f": plus(func("g", plus(y(), const(1)), x()), func("g", x(), y())),
+  "g": plus(x(), y())
 }
 
 s1 = default_schedule(func_info, "f")
