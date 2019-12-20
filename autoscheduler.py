@@ -215,6 +215,79 @@ def eval_expr(env, expr):
     raise Exception("expression type " + str(expr) + " not supported")
 
 
+def print_expr(expr):
+  if expr["type"] == VAR:
+    return expr["var"]
+
+  elif expr["type"] == CONST:
+    return str(expr["val"])
+
+  elif expr["type"] == FUNC:
+    val_x = print_expr(expr["x"])
+    val_y = print_expr(expr["y"])
+    return "{}({},{})".format(expr["func"], val_x, val_y)
+
+  elif expr["type"] == OP:
+    if expr["op"] == PLUS:
+      val_lhs = print_expr(expr["operands"][0])
+      val_rhs = print_expr(expr["operands"][1])
+      return "{} + {}".format(val_lhs, val_rhs)
+
+    elif expr["op"] == MINUS:
+      val_lhs = print_expr(expr["operands"][0])
+      val_rhs = print_expr(expr["operands"][1])
+      return "{} - {}".format(val_lhs, val_rhs)
+
+    elif expr["op"] == TIMES:
+      val_lhs = print_expr(expr["operands"][0])
+      val_rhs = print_expr(expr["operands"][1])
+      return "{} * {}".format(val_lhs, val_rhs)
+
+    elif expr["op"] == DIVIDE:
+      val_lhs = print_expr(expr["operands"][0])
+      val_rhs = print_expr(expr["operands"][1])
+      return "{} / {}".format(val_lhs, val_rhs)
+
+    elif expr["op"] == SIN:
+      val = print_expr(expr["operands"][0])
+      return "sin({})".format(val)
+
+    elif expr["op"] == COS:
+      val = print_expr(expr["operands"][0])
+      return "cos({})".format(val)
+
+    elif expr["op"] == TAN:
+      val = print_expr(expr["operands"][0])
+      return "cos({})".format(val)
+
+    elif expr["op"] == SQRT:
+      val = print_expr(expr["operands"][0])
+      return "sqrt({})".format(val)
+
+
+# get ancestry paths for compute nodes
+def get_ancestor_map(schedule):
+  ancestor_map = {}
+  ancestors = []
+  visit_list = [schedule]
+  while len(visit_list) > 0:
+    node = visit_list.pop()
+
+    if node["type"] == SENTRY:
+      ancestors.pop()
+
+    elif node["type"] in [ROOT, LOOP, STORAGE]:
+      visit_list.append(sentry())
+      visit_list.extend(list(reversed(node["children"])))
+      ancestors.append(node)
+
+    elif node["type"] == COMPUTE:
+      ancestor_map[node["func"]] = list(ancestors)
+
+  return ancestor_map
+
+
+
 def get_calls(expr, f):
   if expr["type"] == FUNC:
     if expr["func"] == f:
@@ -728,7 +801,7 @@ def deinline(func_info, schedule):
     yield new_schedule
 
 
-## bounds inference
+### bounds inference
 
 def symname(func, var, n=None):
   if n is None:
@@ -737,7 +810,7 @@ def symname(func, var, n=None):
   else:
     return "{}_{}_{}".format(func, var, n)
 
-def infer_bounds(func_info, schedule, outf, width, height):
+def infer_bounds(func_info, outf, schedule, width, height):
   global solver
 
   solver.push()
@@ -795,29 +868,14 @@ def infer_bounds(func_info, schedule, outf, width, height):
     variant_map[(f,X_VAR)] = []
     variant_map[(f,Y_VAR)] = []
 
+  ancestor_map = get_ancestor_map(schedule)
   visited_compute_nodes = set([(outf,X_VAR),(outf,Y_VAR)])
-  ancestors = [] 
   visit_list = [schedule]
   while len(visit_list) > 0:
     node = visit_list.pop()
 
-    if node["type"] == SENTRY:
-      ancestors.pop()
-
-    elif node["type"] == ROOT:
-      visit_list.append(sentry())
+    if node["type"] in [ROOT, LOOP, STORAGE]:
       visit_list.extend(list(reversed(node["children"])))
-      ancestors.append(node)
-
-    elif node["type"] == LOOP:
-      visit_list.append(sentry())
-      visit_list.extend(list(reversed(node["children"])))
-      ancestors.append(node)
-
-    elif node["type"] == STORAGE:
-      visit_list.append(sentry())
-      visit_list.extend(list(reversed(node["children"])))
-      ancestors.append(node)
 
     # only try to infer bounds for non-output functions
     elif node["type"] == COMPUTE and not node["func"] == outf:
@@ -825,17 +883,22 @@ def infer_bounds(func_info, schedule, outf, width, height):
       visited_compute_nodes.add((func,X_VAR))
       visited_compute_nodes.add((func,Y_VAR))
 
-      storage_path = list(ancestors)
-      while not (storage_path[0]["type"] == STORAGE and storage_path[0]["func"] == func):
-        storage_path.pop(0)
-
       callers = get_callers(func_info, func)
       for caller in callers:
+        callee_path = ancestor_map[func]
+        caller_path = ancestor_map[caller]
+
+        # find point of divergence between callee and caller path
+        while (len(callee_path) > 0 and len(caller_path) > 0) \
+              and callee_path[0] == caller_path[0]:
+          callee_path.pop(0)
+          caller_path.pop(0)
+
         # compute loop indices for callers by traversing path from
         # storage node to compute node; these then are multiplied together
         caller_x_list = []
         caller_y_list = []
-        for node in storage_path:
+        for node in caller_path:
           if node["type"] == LOOP and node["func"] == caller:
             if node["var"] in [X_VAR, X_INNER_VAR, X_OUTER_VAR]:
               caller_x_list.append(expr_to_symval(None, None, node["size"]))
@@ -911,7 +974,8 @@ def infer_bounds(func_info, schedule, outf, width, height):
   ## compute loop sizes
   size_map = {}
   for key in visited_compute_nodes:
-    size = max_map[key] - min_map[key] + 1
+    val_list = [max_map[key], min_map[key]]
+    size = max(val_list) - min_map[key] + 1
     size_map[key] = size
 
   return size_map
@@ -960,7 +1024,7 @@ def execution_info(func_info, schedule):
     "sqrt": 0
   }
 
-  ancestors  = []
+  ancestor_map = get_ancestor_map(schedule)
   visit_list = [schedule]
 
   while len(visit_list) > 0:
@@ -972,32 +1036,21 @@ def execution_info(func_info, schedule):
       if loop["loop_type"] == SEQUENTIAL:
         iterations *= loop["size"]
 
-    if node["type"] == SENTRY:
-      ancestors.pop()
-
-    elif node["type"] == ROOT:
-      visit_list.append(sentry())
+    elif node["type"] in [ROOT, LOOP]:
       visit_list.extend(list(reversed(node["children"])))
-      ancestors.append(node)
-
-    elif node["type"] == LOOP:
-      visit_list.append(sentry())
-      visit_list.extend(list(reversed(node["children"])))
-      ancestors.append(node)
 
     elif node["type"] == STORAGE:
       info["store"] += (iterations * node["size"])
       info["store"]
 
-      visit_list.append(sentry())
       visit_list.extend(list(reversed(node["children"])))
-      ancestors.append(node)
 
     elif node["type"] == COMPUTE:
       cur_node = node
       expr_list = [func_info[node["func"]]]
       inlined_funcs = [c["func"] for c in cur_node["children"]]
 
+      # TODO check this
       while len(expr_list) > 0:
         expr = expr_list.pop()
         if expr["type"] == CONST:
@@ -1046,17 +1099,16 @@ def execution_info(func_info, schedule):
             for c in cur_node["children"]:
               if c["func"] == expr["func"]:
                 cur_node = c
+                inlined_funcs = [c["func"] for c in cur_node["children"]]
                 break
-
-            inlined_funcs = [c["func"] for c in cur_node["children"]]
 
   return info
 
 
-LOAD_WEIGHT   = 1.0
-STORE_WEIGHT  = 1.0
+LOAD_WEIGHT   = 1.5
+STORE_WEIGHT  = 1.5
 ARITH_WEIGHT  = 1.0
-MATH_WEIGHT   = 3.0
+MATH_WEIGHT   = 10.0
 
 def estimate_cost(exec_info):
   cost = 0.0
@@ -1089,7 +1141,7 @@ def mutate(func_info, schedule):
         yield mutant
 
 # genetic algorithm search
-NUM_GENERATIONS = 20
+NUM_GENERATIONS = 10
 POPULATION_SIZE = 250
 SELECTION_NUM   = 50
 
@@ -1098,7 +1150,7 @@ def search_schedule(func_info, outf, width, height):
   estimator = cost_estimator(func_info)
 
   default = default_schedule(func_info, outf)
-  size_map = infer_bounds(func_info, default, outf, width, height)
+  size_map = infer_bounds(func_info, outf, default, width, height)
   annot_default = annotate_schedule_size(size_map, default)
   population.append((default,annot_default))
 
@@ -1127,7 +1179,7 @@ def search_schedule(func_info, outf, width, height):
     # mutation
     for selected in selected_list:
       for mutant in mutate(func_info, selected):
-        size_map = infer_bounds(func_info, mutant, outf, width, height)
+        size_map = infer_bounds(func_info, outf, mutant, width, height)
         annot_mutant = annotate_schedule_size(size_map, mutant)
         population.append((mutant, annot_mutant))
 
@@ -1139,6 +1191,7 @@ def search_schedule(func_info, outf, width, height):
 
   for _,schedule in population:
     print_schedule(schedule)
+    print "exec info", execution_info(func_info, schedule)
     print "cost", estimator(schedule)
 
   return population[0][1]
@@ -1146,22 +1199,100 @@ def search_schedule(func_info, outf, width, height):
 
 ### convert schedule tree into halide code
 
-def convert_to_halide(schedule):
-  pass
+def convert_to_halide(func_info, out_f, schedule, width, height):
+  instructions = []
 
+  # instructions variables and function defs
+  vars_str = ",".join([X_VAR, X_OUTER_VAR, X_INNER_VAR, Y_VAR, Y_OUTER_VAR, Y_INNER_VAR])
+  instructions.append("Var {};".format(vars_str))
+
+  funcs_str = ",".join(["{}(\"{}\")".format(f, f) for f in func_info])
+  instructions.append("Func {};".format(funcs_str))
+
+  instructions.append("")
+  for f, fdef in func_info.items():
+    fdef_str = print_expr(fdef)
+    instructions.append("{}({},{}) = {};".format(f, X_VAR, Y_VAR, fdef_str))
+
+
+  # scheduling instructions
+  ancestor_map = get_ancestor_map(schedule)
+  for f, ancestors in ancestor_map.items():
+    instructions.append("")
+    f_loops = [a for a in ancestors if a["type"] == LOOP and a["func"] == f]
+    f_loop_vars = [f_loop["var"] for f_loop in f_loops]
+    is_x_split = X_INNER_VAR in f_loop_vars
+    is_y_split = Y_INNER_VAR in f_loop_vars
+
+    if is_x_split:
+      x_split_factor = f_loops[f_loop_vars.index(X_INNER_VAR)]["size"]
+      x_split_instr = \
+          "{}.split({},{},{});".format(f, X_VAR, X_OUTER_VAR, X_INNER_VAR, x_split_factor)
+      instructions.append(x_split_instr)
+
+    if is_y_split:
+      y_split_factor = f_loops[f_loop_vars.index(Y_INNER_VAR)]["size"]
+      y_split_instr = \
+          "{}.split({},{},{});".format(f, Y_VAR, Y_OUTER_VAR, Y_INNER_VAR, y_split_factor)
+      instructions.append(y_split_instr)
+
+    # set loop order
+    reorder_instr = "{}.reorder({});".format(f, ",".join(reversed(f_loop_vars)))
+    instructions.append(reorder_instr)
+
+    # set loop types
+    f_loops_nonseq = [f_loop for f_loop in f_loops if f_loop["loop_type"] != SEQUENTIAL]
+    for f_loop in f_loops_nonseq:
+      if f_loop["loop_type"] == VECTORIZED:
+        vectorize_instr = "{}.vectorize({},{});".format(f, f_loop["var"], f_loop["size"])
+        instructions.append(vectorize_instr)
+
+    # set call order (storage and compute locations)
+    if f != out_f:
+      rev_ancestors = list(reversed(ancestors))
+
+      # the closest loop for a different function is the place where we compute
+      found_store_loc = False
+      found_compute_loc = False
+      storage_ind = -1
+      for i in range(len(rev_ancestors)):
+        a = rev_ancestors[i]
+        if not found_compute_loc and a["type"] == LOOP and a["func"] != f:
+          compute_instr ="{}.compute_at({},{});".format(f, a["func"], a["var"])
+          instructions.append(compute_instr)
+          found_compute_loc = True
+
+        if not found_store_loc and storage_ind >= 0 \
+            and a["type"] == LOOP and a["func"] != f:
+          store_instr = "{}.store_at({},{});".format(f, a["func"], a["var"])
+          instructions.append(store_instr)
+          found_store_loc = True
+
+        if a["type"] == STORAGE and a["func"] == f:
+          storage_ind = i
+
+      if not found_compute_loc:
+        instructions.append("{}.compute_root();".format(f))
+
+      if not found_store_loc:
+        instructions.append("{}.store_root();".format(f))
+
+  realize_instr = "Buffer<int32_t> output = {}.realize({},{});".format(f, width, height)
+  instructions.append(realize_instr)
+  return instructions
 
 ### example
 
 func_info = {
-  "f": plus(func("g", plus(y(), const(1)), x()), func("g", x(), y())),
+  "f": plus(func("g", plus(x(), const(1)), y()), func("g", x(), y())),
   "g": sqrt(times(x(), y()))
 }
 
-# s1 = default_schedule(func_info, "f")
-# s2 = list(deinline(func_info, s1))[0]
-# s3 = list(hoist_storage(func_info, s2))[0]
-# 
-# size_map = infer_bounds(func_info, s3, "f", 512, 512)
-# s4 = annotate_schedule_size(size_map, s3)
+s1 = default_schedule(func_info, "f")
+s2 = list(deinline(func_info, s1))[0]
+s3 = list(hoist_storage(func_info, s2))[0]
+
+size_map = infer_bounds(func_info, "f", s3, 512, 512)
+s4 = annotate_schedule_size(size_map, s3)
 
 
