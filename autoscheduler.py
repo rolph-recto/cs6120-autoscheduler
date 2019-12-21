@@ -1001,7 +1001,17 @@ def annotate_schedule_size(size_map, schedule):
     return compute(schedule["func"], map(copy_schedule, schedule["children"]))
 
 
+def get_iterations(ancestry_path):
+  iterations = 1
+  for loop in [a for a in ancestry_path if a["type"] == LOOP]:
+    if loop["type"] == SEQUENTIAL:
+      iterations *= loop["size"]
+
+  return iterations
+
 ### cost estimation
+
+
 
 # give information about:
 # - the number of arithmetic operations performed
@@ -1011,7 +1021,8 @@ def annotate_schedule_size(size_map, schedule):
 # this function assumes the loops in schedule have been decorated
 # with size information, computed during bounds inference
 def execution_info(func_info, schedule):
-  info = {
+  exec_info = {
+    "mem": 0,
     "load": 0,
     "store": 0,
     "+": 0,
@@ -1029,82 +1040,77 @@ def execution_info(func_info, schedule):
 
   while len(visit_list) > 0:
     node = visit_list.pop()
-    upstream_loops = [a for a in ancestors if a["type"] == LOOP]
-    iterations = 1
-    for loop in upstream_loops:
-      # don't multiply iterations if loop is vectorized
-      if loop["loop_type"] == SEQUENTIAL:
-        iterations *= loop["size"]
 
-    elif node["type"] in [ROOT, LOOP]:
+    if node["type"] in [ROOT, LOOP]:
       visit_list.extend(list(reversed(node["children"])))
 
     elif node["type"] == STORAGE:
-      info["store"] += (iterations * node["size"])
-      info["store"]
+      exec_info["mem"] += node["size"]
 
       visit_list.extend(list(reversed(node["children"])))
 
     elif node["type"] == COMPUTE:
-      cur_node = node
-      expr_list = [func_info[node["func"]]]
-      inlined_funcs = [c["func"] for c in cur_node["children"]]
+      ancestry_path = ancestor_map[node["func"]]
+      iterations = get_iterations(ancestry_path)
+      exec_info["store"] += iterations
 
-      # TODO check this
-      while len(expr_list) > 0:
-        expr = expr_list.pop()
-        if expr["type"] == CONST:
-          pass
+      inline_map = {}
 
-        elif expr["type"] == VAR:
+      worklist = [node]
+      while len(worklist) > 0:
+        inline_node = worklist.pop()
+        children = inline_node["children"]
+        inline_map[inline_node["func"]] = [c["func"] for c in children]
+        worklist.extend(children)
+
+      def expr_execution_info(func, expr):
+        if expr["type"] in [CONST, VAR]:
           pass
 
         elif expr["type"] == OP:
           if expr["op"] == PLUS:
-            info["+"] += iterations
+            exec_info["+"] += iterations
 
           elif expr["op"] == MINUS:
-            info["-"] += iterations
+            exec_info["-"] += iterations
 
           elif expr["op"] == TIMES:
-            info["*"] += iterations
+            exec_info["*"] += iterations
 
           elif expr["op"] == DIVIDE:
-            info["/"] += iterations
+            exec_info["/"] += iterations
 
           elif expr["op"] == SIN:
-            info["sin"] += iterations
+            exec_info["sin"] += iterations
 
           elif expr["op"] == COS:
-            info["cos"] += iterations
+            exec_info["cos"] += iterations
 
           elif expr["op"] == TAN:
-            info["tan"] += iterations
+            exec_info["tan"] += iterations
 
           elif expr["op"] == SQRT:
-            info["sqrt"] += iterations
+            exec_info["sqrt"] += iterations
 
-          expr_list.extend(expr["operands"])
+          for operand in expr["operands"]:
+            expr_execution_info(func, operand)
 
         elif expr["type"] == FUNC:
           # already saved; load from storage
-          if expr["func"] not in inlined_funcs:
-            info["load"] += iterations
-
-          # inlined, so we need to compute
+          if expr["func"] not in inline_map[func]:
+            exec_info["load"] += iterations
+            
+          # inlined
           else:
-            f = func_info[expr["func"]]
-            expr_list.append(f)
+            f = expr["func"]
+            fdef = func_info[f]
+            expr_execution_info(f, fdef)
 
-            for c in cur_node["children"]:
-              if c["func"] == expr["func"]:
-                cur_node = c
-                inlined_funcs = [c["func"] for c in cur_node["children"]]
-                break
+      expr_execution_info(node["func"], func_info[node["func"]])
 
-  return info
+  return exec_info
 
-
+MEM_WEIGHT    = 0.5
 LOAD_WEIGHT   = 1.5
 STORE_WEIGHT  = 1.5
 ARITH_WEIGHT  = 1.0
@@ -1112,6 +1118,7 @@ MATH_WEIGHT   = 10.0
 
 def estimate_cost(exec_info):
   cost = 0.0
+  cost += MEM_WEIGHT * float(exec_info["mem"])
   cost += LOAD_WEIGHT * float(exec_info["load"])
   cost += STORE_WEIGHT * float(exec_info["store"])
 
@@ -1132,8 +1139,10 @@ def cost_estimator(func_info):
 
 
 def mutate(func_info, schedule):
-  mutators = [split, reorder, change_loop_type, hoist_compute, \
-              lower_compute, hoist_storage, inline, deinline]
+  mutators = [deinline, hoist_storage, hoist_compute,
+              split, reorder, change_loop_type, \
+              lower_compute, inline]
+  # random.shuffle(mutators)
 
   for mutator in mutators:
     for mutant in mutator(func_info, schedule):
@@ -1142,10 +1151,10 @@ def mutate(func_info, schedule):
 
 # genetic algorithm search
 NUM_GENERATIONS = 10
-POPULATION_SIZE = 250
-SELECTION_NUM   = 50
+POPULATION_SIZE = 500
+SELECTION_NUM   = 500
 
-def search_schedule(func_info, outf, width, height):
+def search_schedule(func_info, outf, width, height, debug=False):
   population = []
   estimator = cost_estimator(func_info)
 
@@ -1156,25 +1165,27 @@ def search_schedule(func_info, outf, width, height):
 
   gen = 1
   while gen < NUM_GENERATIONS:
-    print "generation", str(gen), "population", str(len(population))
-    print "best schedule, cost", round(estimator(population[0][1]), 2)
-    print_schedule(population[0][1])
+    if debug:
+      print "generation", str(gen), "population", str(len(population))
+      print "best schedule, cost", round(estimator(population[0][1]), 2)
+      print_schedule(population[0][1])
 
     # "roulette" selection
     pop_inv_cost = [(s,1.0/estimator(a)) for (s,a) in population]
     total = sum(map(lambda (s,c): c, pop_inv_cost))
 
-    selected_list = []
-    for i in range(SELECTION_NUM):
-      n = total * random.random()
-      p = 0.0
+    selected_list = [s for (s,a) in population]
+    # selected_list = []
+    # for i in range(SELECTION_NUM):
+    #   n = total * random.random()
+    #   p = 0.0
 
-      for s,c in ((s,c) for (s,c) in pop_inv_cost if s not in selected_list):
-        p += c
-        if p >= n:
-          selected_list.append(s)
-          total -= c
-          break
+    #   for s,c in ((s,c) for (s,c) in pop_inv_cost if s not in selected_list):
+    #     p += c
+    #     if p >= n:
+    #       selected_list.append(s)
+    #       total -= c
+    #       break
 
     # mutation
     for selected in selected_list:
@@ -1185,14 +1196,9 @@ def search_schedule(func_info, outf, width, height):
 
     # only keep the fittest
     population.sort(key=(lambda (s,a): a), \
-        cmp=lambda s1, s2: estimator(s1) <= estimator(s2))
+        cmp=lambda s1, s2: int(estimator(s1) - estimator(s2)))
     population = population[:POPULATION_SIZE]
     gen += 1
-
-  for _,schedule in population:
-    print_schedule(schedule)
-    print "exec info", execution_info(func_info, schedule)
-    print "cost", estimator(schedule)
 
   return population[0][1]
 
@@ -1289,10 +1295,15 @@ func_info = {
 }
 
 s1 = default_schedule(func_info, "f")
+size_map1 = infer_bounds(func_info, "f", s1, 512, 512)
+s1a = annotate_schedule_size(size_map1, s1)
+
 s2 = list(deinline(func_info, s1))[0]
+
 s3 = list(hoist_storage(func_info, s2))[0]
 
-size_map = infer_bounds(func_info, "f", s3, 512, 512)
-s4 = annotate_schedule_size(size_map, s3)
+s4 = list(hoist_compute(func_info, s3))[0]
+size_map4 = infer_bounds(func_info, "f", s4, 512, 512)
+s4a = annotate_schedule_size(size_map4, s4)
 
 
