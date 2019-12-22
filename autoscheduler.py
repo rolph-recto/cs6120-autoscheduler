@@ -1110,9 +1110,9 @@ def execution_info(func_info, schedule):
 
   return exec_info
 
-MEM_WEIGHT    = 0.5
-LOAD_WEIGHT   = 1.5
-STORE_WEIGHT  = 1.5
+MEM_WEIGHT    = 0.1
+LOAD_WEIGHT   = 0.5
+STORE_WEIGHT  = 0.5
 ARITH_WEIGHT  = 1.0
 MATH_WEIGHT   = 10.0
 
@@ -1142,7 +1142,7 @@ def mutate(func_info, schedule):
   mutators = [deinline, hoist_storage, hoist_compute,
               split, reorder, change_loop_type, \
               lower_compute, inline]
-  # random.shuffle(mutators)
+  random.shuffle(mutators)
 
   for mutator in mutators:
     for mutant in mutator(func_info, schedule):
@@ -1151,17 +1151,17 @@ def mutate(func_info, schedule):
 
 # genetic algorithm search
 NUM_GENERATIONS = 10
-POPULATION_SIZE = 500
-SELECTION_NUM   = 500
+POPULATION_SIZE = 300
+SELECTION_NUM   = 300
 
 def search_schedule(func_info, outf, width, height, debug=False):
-  population = []
   estimator = cost_estimator(func_info)
 
   default = default_schedule(func_info, outf)
   size_map = infer_bounds(func_info, outf, default, width, height)
   annot_default = annotate_schedule_size(size_map, default)
-  population.append((default,annot_default))
+
+  population = [(default,annot_default)]
 
   gen = 1
   while gen < NUM_GENERATIONS:
@@ -1203,6 +1203,46 @@ def search_schedule(func_info, outf, width, height, debug=False):
   return population[0][1]
 
 
+DEPTH       = 10
+BEAM_WIDTH  = 300
+def beam_search_schedule(func_info, outf, width, height, debug=False, \
+                          depth=DEPTH, beam_width=BEAM_WIDTH):
+
+  estimator = cost_estimator(func_info)
+
+  default = default_schedule(func_info, outf)
+  size_map = infer_bounds(func_info, outf, default, width, height)
+  annot_default = annotate_schedule_size(size_map, default)
+
+  population = [(default,annot_default)]
+  best = population[0]
+
+  gen = 1
+  while gen < depth and len(population) > 0:
+    if debug:
+      print "generation", str(gen), "population", str(len(population))
+      print "best schedule, cost", round(estimator(best[1]), 2)
+      print_schedule(best[1])
+
+    next_gen = []
+    for selected in (s for (s,a) in population):
+      for mutant in mutate(func_info, selected):
+        size_map = infer_bounds(func_info, outf, mutant, width, height)
+        annot_mutant = annotate_schedule_size(size_map, mutant)
+        next_gen.append((mutant, annot_mutant))
+
+    # only keep the fittest
+    next_gen.sort(key=(lambda (s,a): a), \
+        cmp=lambda s1, s2: int(estimator(s1) - estimator(s2)))
+    population = next_gen[:beam_width]
+
+    if estimator(best[1]) > estimator(population[0][1]):
+      best = population[0]
+
+    gen += 1
+
+  return best[1]
+
 ### convert schedule tree into halide code
 
 def convert_to_halide(func_info, out_f, schedule, width, height):
@@ -1233,13 +1273,13 @@ def convert_to_halide(func_info, out_f, schedule, width, height):
     if is_x_split:
       x_split_factor = f_loops[f_loop_vars.index(X_INNER_VAR)]["size"]
       x_split_instr = \
-          "{}.split({},{},{});".format(f, X_VAR, X_OUTER_VAR, X_INNER_VAR, x_split_factor)
+          "{}.split({},{},{},{});".format(f, X_VAR, X_OUTER_VAR, X_INNER_VAR, x_split_factor)
       instructions.append(x_split_instr)
 
     if is_y_split:
       y_split_factor = f_loops[f_loop_vars.index(Y_INNER_VAR)]["size"]
       y_split_instr = \
-          "{}.split({},{},{});".format(f, Y_VAR, Y_OUTER_VAR, Y_INNER_VAR, y_split_factor)
+          "{}.split({},{},{},{});".format(f, Y_VAR, Y_OUTER_VAR, Y_INNER_VAR, y_split_factor)
       instructions.append(y_split_instr)
 
     # set loop order
@@ -1283,27 +1323,27 @@ def convert_to_halide(func_info, out_f, schedule, width, height):
       if not found_store_loc:
         instructions.append("{}.store_root();".format(f))
 
-  realize_instr = "Buffer<int32_t> output = {}.realize({},{});".format(f, width, height)
+  realize_instr = "{}.realize({},{});".format(f, width, height)
   instructions.append(realize_instr)
   return instructions
 
 ### example
 
-func_info = {
-  "f": plus(func("g", plus(x(), const(1)), y()), func("g", x(), y())),
-  "g": sqrt(times(x(), y()))
-}
-
-s1 = default_schedule(func_info, "f")
-size_map1 = infer_bounds(func_info, "f", s1, 512, 512)
-s1a = annotate_schedule_size(size_map1, s1)
-
-s2 = list(deinline(func_info, s1))[0]
-
-s3 = list(hoist_storage(func_info, s2))[0]
-
-s4 = list(hoist_compute(func_info, s3))[0]
-size_map4 = infer_bounds(func_info, "f", s4, 512, 512)
-s4a = annotate_schedule_size(size_map4, s4)
+# func_info = {
+#   "f": plus(func("g", plus(x(), const(1)), y()), func("g", x(), y())),
+#   "g": sqrt(times(x(), y()))
+# }
+# 
+# s1 = default_schedule(func_info, "f")
+# size_map1 = infer_bounds(func_info, "f", s1, 512, 512)
+# s1a = annotate_schedule_size(size_map1, s1)
+# 
+# s2 = list(deinline(func_info, s1))[0]
+# 
+# s3 = list(hoist_storage(func_info, s2))[0]
+# 
+# s4 = list(hoist_compute(func_info, s3))[0]
+# size_map4 = infer_bounds(func_info, "f", s4, 512, 512)
+# s4a = annotate_schedule_size(size_map4, s4)
 
 
